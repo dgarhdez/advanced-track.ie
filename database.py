@@ -45,13 +45,9 @@ class DatabaseConnector:
 
     def get_query_as_df(self, query):
         """Executes a SQL query and returns the result as a pandas DataFrame."""
-        try:
-            with self.engine.connect() as connection:
-                df = pd.read_sql(query, connection)
-                return df
-        except Exception as e:
-            print(f"Error executing query: {e}")
-            return pd.DataFrame()
+        with self.engine.connect() as connection:
+            df = pd.read_sql(query, connection)
+            return df
 
 # Usage Example:
 # db = DatabaseConnector()

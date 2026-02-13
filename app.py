@@ -42,11 +42,13 @@ if selected_page == "Executive Summary":
     # Example Data Fetch
     st.subheader("Recent Flights (Live Data)")
     try:
-        flights_df = db.engine.connect().execute(queries.GET_FLIGHTS).fetchall()
-        # Convert to DataFrame for better display
-        import pandas as pd
-        flights_df = pd.DataFrame(flights_df)
-        st.dataframe(flights_df)
+        # Use the helper method which handles DataFrame creation
+        flights_df = db.get_query_as_df(queries.GET_FLIGHTS)
+        
+        if flights_df.empty:
+            st.warning("No flight data found.")
+        else:
+            st.dataframe(flights_df)
     except Exception as e:
         st.error(f"Error fetching data: {e}")
 
@@ -59,7 +61,7 @@ elif selected_page == "Fleet Manager":
     
     # Fetch Airplane Data
     try:
-        airplanes_df = pd.read_sql(queries.GET_AIRPLANES, db.engine)
+        airplanes_df = db.get_query_as_df(queries.GET_AIRPLANES)
         st.dataframe(airplanes_df)
     except Exception as e:
         st.error(f"Error fetching fleet data: {e}")
