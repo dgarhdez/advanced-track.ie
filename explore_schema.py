@@ -4,7 +4,7 @@ import pandas as pd
 db = DatabaseConnector()
 
 print("--- TICKETS columns ---")
-df_tickets = db.get_query_as_df("SELECT * FROM IEMASTER.TICKETS FETCH FIRST 1 ROWS ONLY")
+df_tickets = db.get_query_as_df("SELECT * FROM IEPLANE.TICKETS FETCH FIRST 1 ROWS ONLY")
 print(df_tickets.columns.tolist())
 
 print("\n--- AIRPLANES columns ---")
