@@ -212,3 +212,6 @@ __marimo__/
 
 # VS Code
 .vscode/
+
+#ENV
+.env
