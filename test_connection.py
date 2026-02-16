@@ -1,34 +1,40 @@
-from sqlalchemy import create_engine
 import os
 from dotenv import load_dotenv
+from sqlalchemy import create_engine
+from sqlalchemy.engine import URL
+
 import pandas as pd
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
 username = os.getenv("DB_USERNAME")
 password = os.getenv("DB_PASSWORD")
 host = os.getenv("DB_HOST")
 port = os.getenv("DB_PORT")
-dbname = os.getenv("DB_NAME")
+database = os.getenv("DB_NAME")
 
-# Basic validation
-if not all([username, password, host, port, dbname]):
-    print("Error: One or more environment variables are missing. Please check your .env file.")
-    exit(1)
+# Option 1: Build connection URL using SQLAlchemy's URL helper
+connection_url = URL.create(
+    "db2+ibm_db",
+    username=username,
+    password=password,
+    host=host,
+    port=port,
+    database=database
+)
+engine = create_engine(connection_url)
 
-connection_string = f"db2+ibm_db://{username}:{password}@{host}:{port}/{dbname}"
 
+# Test connection
 try:
-    print(f"Attempting to connect to {host}:{port}/{dbname} as {username}...")
-    engine = create_engine(connection_string)
-    
-    # Test query
-    query = "SELECT * FROM IEPLANE.FLIGHTS FETCH FIRST 5 ROWS ONLY"
-    df = pd.read_sql(query, engine)
-    
-    print("\nConnection successful!")
-    print("Sample data:")
-    print(df)
+    with engine.connect() as connection:
+        print("Successfully connected to the database!")
 except Exception as e:
-    print(f"\nConnection failed: {e}")
+    print(f"Error connecting to database: {e}")
+
+
+query = "SELECT * FROM IEPLANE.FLIGHTS FETCH FIRST 10 ROWS ONLY"
+df = pd.read_sql(query, engine)
+
+print(df.head())

@@ -197,7 +197,44 @@ Now you have access to the data through pandas, you should follow these steps.
     * Committing your code and pushing it to your fork.
     * Sharing the link to your forked repository with all necessary instructions to run your project.
 
-## 4. Troubleshooting
+## 4. Run the Executive Command Center
+
+This repository now includes a Streamlit app entry point at `streamlit_app.py`.
+
+### Current scope (Phases 1-2)
+
+The current implementation delivers:
+
+**Financial Performance**
+
+* Total Revenue (`TICKETS.total_amount`)
+* RASM (`Total Revenue / Available Seat Miles`)
+* Route profitability with "Cash Cow" vs "Money Pit" classification
+* Ancillary revenue analysis (`airport_tax` and `local_tax` versus base `price`)
+* Estimated operating cost including:
+  * Fuel cost (`AIRPLANES.fuel_gallons_hour` * flight duration * fuel price)
+  * Staff cost from federated `STAFF` + `FLIGHT_CREW` tables (pilot/attendant average salary model)
+
+**Fleet Operations & Efficiency**
+
+* Fleet utilization by aircraft and model
+* Maintenance health alerts (A-check, B-check, takeoffs, flight-hours thresholds)
+* Fuel efficiency leaderboard by model
+
+### Run locally
+
+```bash
+uv sync
+uv run streamlit run streamlit_app.py
+```
+
+Optional environment variable (defaults to `IEPLANE`):
+
+```bash
+DB_SCHEMA=IEPLANE
+```
+
+## 5. Troubleshooting
 
 * **`NoSuchModuleError: Can't load plugin: sqlalchemy.dialects:db2.ibm_db`**:
     This means the `ibm-db-sa` library is missing. Ensure it is in your `pyproject.toml` and you have run `uv sync`.
