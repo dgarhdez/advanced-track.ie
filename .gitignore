@@ -61,6 +61,13 @@ local_settings.py
 db.sqlite3
 db.sqlite3-journal
 
+# DuckDB
+*.duckdb
+*.duckdb.wal
+
+# Local data files
+data/
+
 # Flask stuff:
 instance/
 .webassets-cache
