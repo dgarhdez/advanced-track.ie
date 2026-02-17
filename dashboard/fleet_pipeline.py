@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
+from pathlib import Path
 from typing import Any, Iterable
 
 import duckdb
 import pandas as pd
 
-from database_connector import DatabaseConnector
-from dashboard.financial_pipeline import DEFAULT_SCHEMA, sanitize_schema
+try:
+    import polars as pl
+except ModuleNotFoundError:  # pragma: no cover - exercised when polars isn't installed
+    pl = None  # type: ignore[assignment]
+
+from dashboard.financial_pipeline import (
+    sanitize_schema,
+    run_duckdb_query,
+)
 
 
 def build_fleet_filters(
@@ -40,28 +48,56 @@ def build_fleet_filters(
     return f"WHERE {' AND '.join(clauses)}", params
 
 
+def _to_pandas_frame(df: Any) -> pd.DataFrame:
+    if pl is not None and isinstance(df, pl.DataFrame):
+        return df.to_pandas()
+    if isinstance(df, pd.DataFrame):
+        return df.copy()
+    return pd.DataFrame(df)
+
+
+def _to_polars_frame(df: Any) -> "pl.DataFrame":
+    if pl is None:
+        raise RuntimeError("polars is not installed.")
+    if isinstance(df, pl.DataFrame):
+        return df.clone()
+    if isinstance(df, pd.DataFrame):
+        return pl.from_pandas(df)
+    return pl.DataFrame(df)
+
+
 def get_fleet_filter_options(
     env_path: str = ".env",
     schema: str | None = None,
+    database_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    schema_name = sanitize_schema(schema)
-    connector = DatabaseConnector(env_path=env_path)
-    try:
-        bounds_query = f"""
-            SELECT
-                MIN(DATE(departure)) AS min_date,
-                MAX(DATE(departure)) AS max_date
-            FROM {schema_name}.FLIGHTS
-        """
-        model_query = f"""
-            SELECT DISTINCT model
-            FROM {schema_name}.AIRPLANES
-            ORDER BY model
-        """
-        bounds_df = connector.execute_query(bounds_query)
-        model_df = connector.execute_query(model_query)
-    finally:
-        connector.dispose()
+    sanitize_schema(schema)
+    bounds_query = """
+        SELECT
+            MIN(CAST(departure AS DATE)) AS min_date,
+            MAX(CAST(departure AS DATE)) AS max_date
+        FROM FLIGHTS
+    """
+    model_query = """
+        SELECT DISTINCT model
+        FROM AIRPLANES
+        ORDER BY model
+    """
+    bounds_df = run_duckdb_query(
+        bounds_query,
+        env_path=env_path,
+        database_path=database_path,
+        as_polars=pl is not None,
+    )
+    model_df = run_duckdb_query(
+        model_query,
+        env_path=env_path,
+        database_path=database_path,
+        as_polars=pl is not None,
+    )
+
+    bounds_df = _to_pandas_frame(bounds_df)
+    model_df = _to_pandas_frame(model_df)
 
     bounds_df.columns = [column.lower() for column in bounds_df.columns]
     model_df.columns = [column.lower() for column in model_df.columns]
@@ -79,8 +115,9 @@ def extract_fleet_base_data(
     models: Iterable[str] | None = None,
     env_path: str = ".env",
     schema: str | None = None,
+    database_path: str | Path | None = None,
 ) -> pd.DataFrame:
-    schema_name = sanitize_schema(schema)
+    sanitize_schema(schema)
     where_clause, params = build_fleet_filters(
         start_date=start_date, end_date=end_date, models=models
     )
@@ -102,23 +139,83 @@ def extract_fleet_base_data(
             COALESCE(a.total_flight_distance, 0) AS total_flight_distance,
             COALESCE(r.distance, 0) AS route_distance,
             COALESCE(r.flight_minutes, 0) AS route_flight_minutes
-        FROM {schema_name}.FLIGHTS f
-        INNER JOIN {schema_name}.AIRPLANES a
+        FROM FLIGHTS f
+        INNER JOIN AIRPLANES a
             ON f.airplane = a.aircraft_registration
-        LEFT JOIN {schema_name}.ROUTES r
+        LEFT JOIN ROUTES r
             ON f.route_code = r.route_code
         {where_clause}
     """
+    df = run_duckdb_query(
+        query,
+        params=params,
+        env_path=env_path,
+        database_path=database_path,
+        as_polars=pl is not None,
+    )
+    return _to_pandas_frame(normalize_fleet_base_data(df))
 
-    connector = DatabaseConnector(env_path=env_path)
-    try:
-        df = connector.execute_query(query, params=params)
-    finally:
-        connector.dispose()
-    return normalize_fleet_base_data(df)
 
+def normalize_fleet_base_data(
+    df: pd.DataFrame | "pl.DataFrame",
+) -> pd.DataFrame | "pl.DataFrame":
+    if pl is not None and isinstance(df, pl.DataFrame):
+        normalized = df.rename({column: column.lower() for column in df.columns})
 
-def normalize_fleet_base_data(df: pd.DataFrame) -> pd.DataFrame:
+        numeric_columns = [
+            "crew_members",
+            "fuel_gallons_hour",
+            "maintenance_takeoffs",
+            "maintenance_flight_hours",
+            "total_flight_distance",
+            "route_distance",
+            "route_flight_minutes",
+            "observed_flight_hours",
+        ]
+        for column in numeric_columns:
+            if column in normalized.columns:
+                normalized = normalized.with_columns(
+                    pl.col(column).cast(pl.Float64, strict=False).fill_null(0.0).alias(column)
+                )
+
+        for column in [
+            "departure",
+            "arrival",
+            "maintenance_last_acheck",
+            "maintenance_last_bcheck",
+        ]:
+            if column in normalized.columns:
+                normalized = normalized.with_columns(
+                    pl.col(column).cast(pl.Datetime, strict=False).alias(column)
+                )
+
+        if "observed_flight_hours" not in normalized.columns:
+            normalized = normalized.with_columns(pl.lit(0.0).alias("observed_flight_hours"))
+
+        if "departure" in normalized.columns and "arrival" in normalized.columns:
+            normalized = normalized.with_columns(
+                (
+                    (pl.col("arrival") - pl.col("departure")).dt.total_seconds() / 3600.0
+                ).alias("_elapsed_hours")
+            ).with_columns(
+                pl.when(pl.col("_elapsed_hours") > 0)
+                .then(pl.col("_elapsed_hours"))
+                .otherwise(pl.col("route_flight_minutes").fill_null(0.0) / 60.0)
+                .alias("observed_flight_hours")
+            ).drop("_elapsed_hours")
+        else:
+            normalized = normalized.with_columns(
+                (pl.col("route_flight_minutes").fill_null(0.0) / 60.0).alias("observed_flight_hours")
+            )
+
+        normalized = normalized.with_columns(
+            pl.col("observed_flight_hours")
+            .cast(pl.Float64, strict=False)
+            .fill_null(0.0)
+            .alias("observed_flight_hours")
+        )
+        return normalized
+
     normalized = df.copy()
     normalized.columns = [column.lower() for column in normalized.columns]
 
@@ -183,7 +280,25 @@ def _primary_trigger(row: pd.Series) -> str:
     return max(ratios, key=ratios.get)
 
 
-def compute_fleet_views(
+def _empty_fleet_views() -> dict[str, Any]:
+    return {
+        "kpis": {
+            "active_aircraft": 0,
+            "total_flights": 0,
+            "total_flight_hours": 0.0,
+            "avg_utilization_hours_per_aircraft": 0.0,
+            "total_route_distance": 0.0,
+            "avg_fuel_gallons_hour": 0.0,
+            "at_risk_aircraft": 0,
+        },
+        "utilization_by_aircraft": pd.DataFrame(),
+        "daily_operations": pd.DataFrame(),
+        "fuel_efficiency_by_model": pd.DataFrame(),
+        "maintenance_alerts": pd.DataFrame(),
+    }
+
+
+def _compute_fleet_views_pandas(
     base_df: pd.DataFrame,
     maintenance_takeoffs_threshold: int,
     maintenance_flight_hours_threshold: int,
@@ -192,23 +307,9 @@ def compute_fleet_views(
     warning_ratio: float = 0.85,
     reference_date: date | None = None,
 ) -> dict[str, Any]:
-    working = normalize_fleet_base_data(base_df)
+    working = _to_pandas_frame(normalize_fleet_base_data(base_df))
     if working.empty:
-        return {
-            "kpis": {
-                "active_aircraft": 0,
-                "total_flights": 0,
-                "total_flight_hours": 0.0,
-                "avg_utilization_hours_per_aircraft": 0.0,
-                "total_route_distance": 0.0,
-                "avg_fuel_gallons_hour": 0.0,
-                "at_risk_aircraft": 0,
-            },
-            "utilization_by_aircraft": pd.DataFrame(),
-            "daily_operations": pd.DataFrame(),
-            "fuel_efficiency_by_model": pd.DataFrame(),
-            "maintenance_alerts": pd.DataFrame(),
-        }
+        return _empty_fleet_views()
 
     connection = duckdb.connect(database=":memory:")
     try:
@@ -393,3 +494,214 @@ def compute_fleet_views(
         "maintenance_alerts": maintenance_alerts,
     }
 
+
+def _compute_fleet_views_polars(
+    base_df: pd.DataFrame | "pl.DataFrame",
+    maintenance_takeoffs_threshold: int,
+    maintenance_flight_hours_threshold: int,
+    a_check_days_threshold: int,
+    b_check_days_threshold: int,
+    warning_ratio: float = 0.85,
+    reference_date: date | None = None,
+) -> dict[str, Any]:
+    if pl is None:
+        return _compute_fleet_views_pandas(
+            _to_pandas_frame(base_df),
+            maintenance_takeoffs_threshold,
+            maintenance_flight_hours_threshold,
+            a_check_days_threshold,
+            b_check_days_threshold,
+            warning_ratio,
+            reference_date,
+        )
+
+    working = normalize_fleet_base_data(_to_polars_frame(base_df))
+    if working.is_empty():
+        return _empty_fleet_views()
+
+    flight_level = (
+        working.with_columns(pl.col("departure").cast(pl.Datetime, strict=False).alias("departure"))
+        .with_columns(pl.col("departure").cast(pl.Date, strict=False).alias("flight_date"))
+        .group_by(["flight_id", "route_code", "departure", "flight_date", "aircraft_registration", "model"])
+        .agg(
+            [
+                pl.col("crew_members").max().alias("crew_members"),
+                pl.col("fuel_gallons_hour").max().alias("fuel_gallons_hour"),
+                pl.col("maintenance_last_acheck").max().alias("maintenance_last_acheck"),
+                pl.col("maintenance_last_bcheck").max().alias("maintenance_last_bcheck"),
+                pl.col("maintenance_takeoffs").max().alias("maintenance_takeoffs"),
+                pl.col("maintenance_flight_hours").max().alias("maintenance_flight_hours"),
+                pl.col("total_flight_distance").max().alias("total_flight_distance"),
+                pl.col("route_distance").max().alias("route_distance"),
+                pl.col("observed_flight_hours").max().alias("observed_flight_hours"),
+            ]
+        )
+    )
+
+    utilization_by_aircraft = (
+        flight_level.group_by(["aircraft_registration", "model"])
+        .agg(
+            [
+                pl.len().alias("flights_operated"),
+                pl.col("observed_flight_hours").sum().alias("flight_hours_operated"),
+                pl.col("route_distance").sum().alias("distance_operated"),
+                pl.col("observed_flight_hours").mean().alias("avg_hours_per_flight"),
+                pl.col("total_flight_distance").max().alias("lifetime_total_flight_distance"),
+                pl.col("crew_members").max().alias("crew_members"),
+                pl.col("fuel_gallons_hour").mean().alias("avg_fuel_gallons_hour"),
+            ]
+        )
+        .sort("flight_hours_operated", descending=True)
+    )
+
+    daily_operations = (
+        flight_level.group_by("flight_date")
+        .agg(
+            [
+                pl.len().alias("flights_operated"),
+                pl.col("observed_flight_hours").sum().alias("flight_hours_operated"),
+                pl.col("route_distance").sum().alias("distance_operated"),
+            ]
+        )
+        .sort("flight_date")
+    )
+
+    fuel_efficiency_by_model = (
+        flight_level.group_by("model")
+        .agg(
+            [
+                pl.len().alias("flights_operated"),
+                pl.col("fuel_gallons_hour").mean().alias("avg_fuel_gallons_hour"),
+                pl.col("route_distance").mean().alias("avg_route_distance"),
+                pl.col("observed_flight_hours").mean().alias("avg_flight_hours"),
+                pl.col("route_distance").sum().alias("_sum_route_distance"),
+                (pl.col("fuel_gallons_hour") * pl.col("observed_flight_hours")).sum().alias("_sum_fuel"),
+            ]
+        )
+        .with_columns(
+            pl.when(pl.col("_sum_route_distance") == 0)
+            .then(0.0)
+            .otherwise((pl.col("_sum_fuel") * 100.0) / pl.col("_sum_route_distance"))
+            .alias("gallons_per_100_miles")
+        )
+        .drop(["_sum_route_distance", "_sum_fuel"])
+        .sort("gallons_per_100_miles")
+    )
+
+    maintenance_snapshot = (
+        flight_level.group_by(["aircraft_registration", "model"])
+        .agg(
+            [
+                pl.col("maintenance_last_acheck").max().alias("maintenance_last_acheck"),
+                pl.col("maintenance_last_bcheck").max().alias("maintenance_last_bcheck"),
+                pl.col("maintenance_takeoffs").max().alias("maintenance_takeoffs"),
+                pl.col("maintenance_flight_hours").max().alias("maintenance_flight_hours"),
+                pl.col("total_flight_distance").max().alias("total_flight_distance"),
+            ]
+        )
+    )
+
+    if maintenance_snapshot.is_empty():
+        maintenance_alerts = pd.DataFrame()
+    else:
+        alerts = maintenance_snapshot.to_pandas()
+        today = reference_date or date.today()
+
+        for column in ["maintenance_last_acheck", "maintenance_last_bcheck"]:
+            alerts[column] = pd.to_datetime(alerts[column], errors="coerce")
+
+        alerts["days_since_acheck"] = (
+            pd.Timestamp(today) - alerts["maintenance_last_acheck"]
+        ).dt.days.fillna(0)
+        alerts["days_since_bcheck"] = (
+            pd.Timestamp(today) - alerts["maintenance_last_bcheck"]
+        ).dt.days.fillna(0)
+
+        takeoff_threshold = max(int(maintenance_takeoffs_threshold), 1)
+        flight_hours_threshold = max(int(maintenance_flight_hours_threshold), 1)
+        a_days_threshold = max(int(a_check_days_threshold), 1)
+        b_days_threshold = max(int(b_check_days_threshold), 1)
+
+        alerts["takeoff_ratio"] = (
+            pd.to_numeric(alerts["maintenance_takeoffs"], errors="coerce").fillna(0.0)
+            / takeoff_threshold
+        )
+        alerts["flight_hours_ratio"] = (
+            pd.to_numeric(alerts["maintenance_flight_hours"], errors="coerce").fillna(0.0)
+            / flight_hours_threshold
+        )
+        alerts["a_check_ratio"] = (
+            pd.to_numeric(alerts["days_since_acheck"], errors="coerce").fillna(0.0) / a_days_threshold
+        )
+        alerts["b_check_ratio"] = (
+            pd.to_numeric(alerts["days_since_bcheck"], errors="coerce").fillna(0.0) / b_days_threshold
+        )
+        alerts["risk_score"] = alerts[
+            ["takeoff_ratio", "flight_hours_ratio", "a_check_ratio", "b_check_ratio"]
+        ].max(axis=1)
+        alerts["status"] = alerts["risk_score"].apply(
+            lambda score: _status_from_score(float(score), float(warning_ratio))
+        )
+        alerts["primary_trigger"] = alerts.apply(_primary_trigger, axis=1)
+        maintenance_alerts = alerts.sort_values(
+            by=["risk_score", "maintenance_takeoffs", "maintenance_flight_hours"],
+            ascending=[False, False, False],
+        )
+
+    active_aircraft = int(utilization_by_aircraft["aircraft_registration"].n_unique())
+    total_flights = int(working.height)
+    total_flight_hours = float(utilization_by_aircraft["flight_hours_operated"].sum())
+    avg_utilization = total_flight_hours / active_aircraft if active_aircraft else 0.0
+    total_route_distance = float(utilization_by_aircraft["distance_operated"].sum())
+    avg_fuel_gph = (
+        float(utilization_by_aircraft["avg_fuel_gallons_hour"].mean())
+        if utilization_by_aircraft.height > 0
+        else 0.0
+    )
+    at_risk_aircraft = int((maintenance_alerts.get("status", pd.Series()) != "Healthy").sum())
+
+    return {
+        "kpis": {
+            "active_aircraft": active_aircraft,
+            "total_flights": total_flights,
+            "total_flight_hours": total_flight_hours,
+            "avg_utilization_hours_per_aircraft": avg_utilization,
+            "total_route_distance": total_route_distance,
+            "avg_fuel_gallons_hour": avg_fuel_gph,
+            "at_risk_aircraft": at_risk_aircraft,
+        },
+        "utilization_by_aircraft": utilization_by_aircraft.to_pandas(),
+        "daily_operations": daily_operations.to_pandas(),
+        "fuel_efficiency_by_model": fuel_efficiency_by_model.to_pandas(),
+        "maintenance_alerts": maintenance_alerts,
+    }
+
+
+def compute_fleet_views(
+    base_df: pd.DataFrame | "pl.DataFrame",
+    maintenance_takeoffs_threshold: int,
+    maintenance_flight_hours_threshold: int,
+    a_check_days_threshold: int,
+    b_check_days_threshold: int,
+    warning_ratio: float = 0.85,
+    reference_date: date | None = None,
+) -> dict[str, Any]:
+    if pl is not None:
+        return _compute_fleet_views_polars(
+            base_df=base_df,
+            maintenance_takeoffs_threshold=maintenance_takeoffs_threshold,
+            maintenance_flight_hours_threshold=maintenance_flight_hours_threshold,
+            a_check_days_threshold=a_check_days_threshold,
+            b_check_days_threshold=b_check_days_threshold,
+            warning_ratio=warning_ratio,
+            reference_date=reference_date,
+        )
+    return _compute_fleet_views_pandas(
+        base_df=_to_pandas_frame(base_df),
+        maintenance_takeoffs_threshold=maintenance_takeoffs_threshold,
+        maintenance_flight_hours_threshold=maintenance_flight_hours_threshold,
+        a_check_days_threshold=a_check_days_threshold,
+        b_check_days_threshold=b_check_days_threshold,
+        warning_ratio=warning_ratio,
+        reference_date=reference_date,
+    )
